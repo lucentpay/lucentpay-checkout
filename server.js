@@ -38,8 +38,8 @@ app.post('/create-checkout-session', async (req, res) => {
         original_amount: amount,
         total_with_fee: total / 100
       },
-      success_url: 'https://yourdomain.com/success',
-      cancel_url: 'https://yourdomain.com/cancel'
+      success_url: 'https://lucentpay.co/pages/payment-success',
+      cancel_url: 'https://lucentpay.co/pages/payment-cancelled'
     });
 
     res.json({ id: session.id });
