@@ -1,108 +1,114 @@
-/* server.js — Complete file */
+// server.js — LucentPay Checkout backend (full file)
+//
+// - Auto-detects Stripe price type and sets Checkout mode accordingly
+// - Permissive to CLI tools (no Origin header) but enforces CORS for browsers
+// - Works for both one-time and recurring Pro membership prices
+//
+// Env vars required on Render (Dashboard → Environment):
+//   STRIPE_SECRET_KEY = sk_test_... or sk_live_...
+//   STRIPE_PRICE_PRO  = price_xxx (the Pro price ID in Stripe)
+//   SITE_BASE_URL     = https://lucentpay.co
+//   ALLOWED_ORIGINS   = https://lucentpay.co,https://www.lucentpay.co
+//
+// Start: `npm start` (Render uses this)
 
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const bodyParser = require('body-parser');
+import express from 'express';
+import dotenv from 'dotenv';
+import Stripe from 'stripe';
+import cors from 'cors';
 
-// --- Config / Stripe ---
+dotenv.config();
+
+const {
+  STRIPE_SECRET_KEY,
+  STRIPE_PRICE_PRO,
+  SITE_BASE_URL = 'https://lucentpay.co',
+  ALLOWED_ORIGINS = ''
+} = process.env;
+
+if (!STRIPE_SECRET_KEY || !STRIPE_PRICE_PRO) {
+  // Don’t crash; show clear message at /
+  console.warn('[WARN] Missing STRIPE_SECRET_KEY or STRIPE_PRICE_PRO');
+}
+
+const stripe = new Stripe(STRIPE_SECRET_KEY || '', {
+  apiVersion: '2024-06-20',
+});
+
 const app = express();
 const PORT = process.env.PORT || 4242;
-const SITE_BASE_URL = process.env.SITE_BASE_URL || 'https://lucentpay.co';
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
-const STRIPE_PRICE_PRO = process.env.STRIPE_PRICE_PRO;
-const stripe = require('stripe')(STRIPE_SECRET_KEY);
 
-// --- CORS ---
-const allowed = (process.env.ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
+// --- CORS (browser) ---
+const allowed = ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
 app.use((req, res, next) => {
-  res.setHeader('X-Powered-By', 'LucentPay Checkout');
-  next();
+  const origin = req.headers.origin;
+  // Allow requests with no Origin (curl/Postman/Stripe webhooks)
+  if (!origin) return next();
+  if (allowed.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  }
+  return next();
+});
+app.options('*', (req, res) => {
+  res.status(204).end();
 });
 
-app.use(cors({
-  origin: function (origin, cb) {
-    // allow same-origin or no origin (like curl/postman)
-    if (!origin) return cb(null, true);
-    if (allowed.includes(origin)) return cb(null, true);
-    return cb(new Error('CORS: Origin not allowed'));
-  },
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type']
-}));
-app.use(bodyParser.json());
+app.use(express.json());
 
-// --- Healthcheck ---
+// Health
 app.get('/', (req, res) => {
-  res.status(200).json({ ok: true, service: 'lucentpay-checkout', time: new Date().toISOString() });
+  res.json({
+    ok: true,
+    service: 'lucentpay-checkout',
+    time: new Date().toISOString(),
+    hasStripeKey: Boolean(STRIPE_SECRET_KEY),
+    hasPrice: Boolean(STRIPE_PRICE_PRO)
+  });
 });
 
-/**
- * Create a Stripe Checkout Session for LucentPay Pro (£95 / year).
- * On success, customer is returned to /pages/verify-pro.
- */
+// Create Stripe Checkout for Pro
 app.post('/create-pro-checkout', async (req, res) => {
   try {
-    if (!STRIPE_PRICE_PRO) throw new Error('Missing STRIPE_PRICE_PRO');
-    const email = req.body && req.body.email ? String(req.body.email).trim() : undefined;
+    if (!STRIPE_SECRET_KEY || !STRIPE_PRICE_PRO) {
+      return res.status(500).json({ error: 'Server not configured for Stripe (missing env).' });
+    }
 
-    const session = await stripe.checkout.sessions.create({
-      mode: 'subscription',
-      line_items: [
-        { price: STRIPE_PRICE_PRO, quantity: 1 }
-      ],
-      customer_email: email || undefined,
+    const { email } = req.body || {};
+
+    // Look up the price to decide mode automatically
+    const price = await stripe.prices.retrieve(STRIPE_PRICE_PRO);
+    const isRecurring = !!price.recurring;
+    const mode = isRecurring ? 'subscription' : 'payment';
+
+    const successUrl = `${SITE_BASE_URL}/pages/verify-pro?status=success&session_id={CHECKOUT_SESSION_ID}`;
+    const cancelUrl  = `${SITE_BASE_URL}/products/lucentpay-pro?status=cancelled`;
+
+    const params = {
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      mode,
+      line_items: [{ price: STRIPE_PRICE_PRO, quantity: 1 }],
+      // optional niceties:
+      billing_address_collection: 'required',
       allow_promotion_codes: false,
-      success_url: `${SITE_BASE_URL}/pages/verify-pro?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${SITE_BASE_URL}/products/lucentpay-pro`,
-      metadata: {
-        product: 'lucentpay_pro_membership'
-      },
-      subscription_data: {
-        metadata: {
-          plan: 'lucentpay_pro_annual'
-        }
-      }
-    });
+      // Pre-fill email if provided
+      ...(email ? { customer_email: email } : {})
+    };
 
-    res.json({ url: session.url });
+    // For one-time payments, submit button text can be set
+    if (!isRecurring) params.submit_type = 'pay';
+
+    const session = await stripe.checkout.sessions.create(params);
+    return res.json({ url: session.url });
   } catch (err) {
-    console.error('Stripe checkout error:', err);
-    res.status(500).json({ error: 'Unable to start checkout' });
+    console.error('Checkout error:', err);
+    return res.status(400).json({ error: 'Unable to start checkout' });
   }
 });
 
-/**
- * Optional: Verify a session from the verify-pro page (if you want).
- * GET /verify-session?session_id=cs_...
- */
-app.get('/verify-session', async (req, res) => {
-  try {
-    const { session_id } = req.query;
-    if (!session_id) return res.status(400).json({ error: 'Missing session_id' });
-
-    const s = await stripe.checkout.sessions.retrieve(session_id, {
-      expand: ['subscription', 'customer']
-    });
-
-    res.json({
-      id: s.id,
-      status: s.status,
-      mode: s.mode,
-      customer_email: s.customer_details?.email || s.customer?.email || null,
-      subscription_status: s.subscription?.status || null
-    });
-  } catch (err) {
-    console.error('verify-session error:', err);
-    res.status(500).json({ error: 'Failed to verify session' });
-  }
-});
-
-// --- Start server ---
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
